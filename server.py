@@ -8,7 +8,9 @@ import time
 from pinecone import Pinecone
 from dotenv import load_dotenv
 from pinecone import AsyncPinecone
-#
+import docker
+import tempfile
+import shutil
 
 load_dotenv()
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") # getting the api key from the env file 
@@ -212,6 +214,105 @@ async def query_cloud_knowledge_base(query: str):
     except Exception as e:
         print(f"RAG Error: {str(e)}", file=sys.stderr)
         return f"Failed to retrieve documentation context from cloud index: {str(e)}"
+
+@server.tool()
+async def execute_code_sandbox(code: str):
+    """
+    Executes raw Python code inside a completely isolated, resource-constrained 
+    Docker container. Features a strict 3-second timeout and 128MB RAM limit.
+    Use this to safely verify algorithms, perform heavy calculations, or test code.
+    """
+    # setup a  isolated workspace inside a temporary directory on my Mac
+    # We execute this inside an async thread pool to keep the main I/O channel completely free.
+    loop = asyncio.get_running_loop()
+    temp_dir = await loop.run_in_executor(None, tempfile.mkdtemp) # make or use a worker thread to make a temp dir
+    script_path = os.path.join(temp_dir, "sandbox_script.py") # path to the sandbox python file
+    
+    def write_script_file():
+        with open(script_path, "w", encoding="utf-8") as f: # opening the sand_box file in write mode and writing the python code in it , code being a str 
+            f.write(code)
+    
+    await loop.run_in_executor(None, write_script_file) # again assign a worker thread to exceute this function , we do this because the write_script_file() func is a blocking function . ie. it is synchronous.
+    print(f"Sandbox Infra: Script written to temporary volume space: {script_path}", file=sys.stderr)
+
+    # Internal worker function that runs on a separate thread to interact with the Docker Engine
+    def run_container():
+        client = docker.from_env()
+        container = None
+        try:
+            # Spawn the strictly resource-constrained container
+            container = client.containers.run(
+                image="python:3.11-alpine",
+                # Execute the script directly and immediately exit when done
+                command=["python", "/workspace/sandbox_script.py"],
+                volumes={
+                    temp_dir: {"bind": "/workspace", "mode": "ro"} # Read-only because we do not trust the llm (the llm should not be always trusted.) because docker doesnt copy our temp file into the container. It instead exposes the temp file through the container. It is like assigning a var b = a . b isnt a copy of a , it IS a any chnage in b results in change in a. If the mount were writable, code running inside the container could modify, delete, or create files in the mounted host directory. hence we restrict the llm to only reading code from this file and not writing code into this file.
+                },
+                detach=True, # with detach = true , the python script for the server and the one in the sandbox run parallelly . The container object gets returned immediately and we can monitor it as it is running it's python script in the sandbox. without detach this server.py would have been blocked till the contaiiner has finished running.
+                network_disabled=True,      #no outbound internet access allowed
+                mem_limit="128m",           # strict protection metric against memory leaks , allocating 128mb of RAM
+                nano_cpus=100000000,        # cap maximum execution speed at 10% of a single CPU core 
+                # actually docker measures 1 CPU = 1,000,000,000 nano CPUs so we are using 0.1% of cpu's compute for this sandbox
+                pids_limit=10              
+            )
+            
+            # Enforce the absolute 3.0 second execution deadline wall
+            # This waits for the container status to shift to finished
+            result = container.wait(timeout=3)
+            exit_code = result.get("StatusCode", 0)
+            
+            # Fetch the compiled execution streams
+            logs = container.logs(stdout=True, stderr=True).decode("utf-8")
+            return exit_code, logs
+            
+        except docker.errors.ContainerError as exc:
+            return -1, f"Execution Container Error: {str(exc)}"
+        except Exception as exc:
+            # If a timeout exception triggers, handle the recovery and cleanup steps immediately
+            if "timeout" in str(exc).lower() or "read timeout" in str(exc).lower():
+                if container:
+                    try:
+                        container.kill() # Force kill the runaway process thread instantly
+                    except Exception:
+                        pass
+                return 124, "TIMEOUT ERROR: Execution exceeded the strict 3.0-second safety deadline."
+            return -1, f"Sandbox Infrastructure Runtime Failure: {str(exc)}"
+            
+        finally:
+            # wipe every container trace out of memory space
+            if container:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
+            # wipe the host machine's temporary file directory cleanly
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    # Run our secure container lifecycle routine seamlessly off the main thread
+    try:
+        print("Sandbox Infra: Allocating resource cgroups and booting container...", file=sys.stderr)
+        exit_code, output_logs = await loop.run_in_executor(None, run_container)
+        # we run the run_container function in a worker thread but we still need detach=True to safely run code. 
+        
+        # 4. Construct the structural report back to Claude over the wire
+        status_label = "SUCCESS" if exit_code == 0 else "FAILED / RUNTIME EXCEPTION"
+        if exit_code == 124:
+            status_label = "TIMEOUT BOUNDARY BREACHED"
+
+        report = (
+            f"--- SANDBOX EXECUTION REPORT ---\n"
+            f"Process Status: {status_label}\n"
+            f"System Exit Code: {exit_code}\n"
+            f"--- STANDARD OUTPUT / ERROR STREAMS ---\n"
+            f"{output_logs if output_logs.strip() else '[No output returned]'}\n"
+        )
+        return report
+
+    except Exception as server_error:
+        print(f"CRITICAL SANDBOX FAULT: {str(server_error)}", file=sys.stderr)
+        return f"Infrastructure Failure: Could not successfully interface with local Docker daemon: {str(server_error)}"
+
+
 
 
 stdout_lock = asyncio.Lock() # ensures that only one task can write to the stdout stream at a time
