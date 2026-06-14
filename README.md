@@ -1,6 +1,6 @@
 # MCP Knowledge Base and Code Execution Server
 
-A production-grade Model Context Protocol (MCP) server built in Python that exposes a cloud-backed RAG (Retrieval-Augmented Generation) knowledge base and a fully sandboxed Python code execution environment to any MCP-compatible LLM client.
+A Model Context Protocol (MCP) server built in Python that exposes a cloud-backed RAG (Retrieval-Augmented Generation) knowledge base and a fully sandboxed Python code execution environment to any MCP-compatible LLM client.
 
 ---
 
