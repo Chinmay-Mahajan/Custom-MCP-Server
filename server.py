@@ -219,7 +219,7 @@ async def query_cloud_knowledge_base(query: str):
 async def execute_code_sandbox(code: str):
     """
     Executes raw Python code inside a completely isolated, resource-constrained 
-    Docker container. Features a strict 3-second timeout and 128MB RAM limit.
+    Docker container. Features a strict 300-second timeout and 512MB RAM limit.
     Use this to safely verify algorithms, perform heavy calculations, or test code.
     """
     # setup a  isolated workspace inside a temporary directory on my Mac
