@@ -22,6 +22,18 @@ pc = AsyncPinecone(api_key=PINECONE_API_KEY)
 print("MCP Server: Synchronizing with Pinecone cloud setup...", file=sys.stderr) # we must print the text to the stderr stream not the usual stdout stream
 # As the MCP server continously operates on the stdin / stdout streams and if we pass a direct plain text sentence into that stream , the json parser will fail to parse it and cause the entire script to fail.
 
+# Define a stable root directory on your Mac host for the sandbox system
+SANDBOX_ROOT = os.path.expanduser("~/.mcp_sandbox_cache")
+PKG_DIR = os.path.join(SANDBOX_ROOT, "site-packages")
+WORKSPACE_DIR = os.path.join(SANDBOX_ROOT, "workspace")
+
+# Ensure these directories exist on your Mac right when the server boots
+os.makedirs(PKG_DIR, exist_ok=True)
+os.makedirs(WORKSPACE_DIR, exist_ok=True)
+
+
+
+
 try:
 
     active_assistants = pc.assistants.list() # returns the list of all assistants currently running in pinecone
@@ -215,18 +227,74 @@ async def query_cloud_knowledge_base(query: str):
         print(f"RAG Error: {str(e)}", file=sys.stderr)
         return f"Failed to retrieve documentation context from cloud index: {str(e)}"
 
+#  Changes made to the sandbox tools  
+# added a tool called install_libs_sandbox to tackle a compromise I was facing. If i free-d some constraints on the sandbox container then I would sacrifice on security.
+# protection against IO hogging tasks wasnt their. 
+# also if we didnt have changed the installed lib would have been wiped out after the tool execution was finsihed.
+
+# so added install_libs_sandbox tool so that LLM (client) can pass needed lib names and we gave pip install them into this container. 
+# Also I have mounted a directory on my mac within which the python lib are installed. 
+
+# in the code_executor tool I just tell python to read lib from that permanant dir on my mac. So I dont need to download the libs again and again 
+
+@server.tool()
+async def install_libs_sandbox(libraries: list):
+    """
+    Installs one or more third-party Python packages (e.g., ['numpy', 'requests']) 
+    into the secure sandbox environment. 
+    Use this tool BEFORE executing code if the user's script requires external libraries.
+    """
+    if not libraries:
+        return "No libraries specified for installation."
+
+    print(f"Sandbox Infra: Launching Installer for: {libraries}", file=sys.stderr)
+    
+    def run_installer():
+        client = docker.from_env()
+        libs_string = " ".join(libraries)
+        try:
+            # Phase 1: High resource allowance, network active, but isolated execution command
+            # It maps the host package directory as Read-Write (rw)
+            client.containers.run(
+                image="python:3.11-alpine",
+                #tell pip to install directly into /cache
+                command=[
+                    "sh", "-c", 
+                    f"python3 -m ensurepip --upgrade && pip install --no-cache-dir --target=/cache {libs_string}"
+                ],
+                volumes={
+                    # Mount host cache directory to /cache inside the container , this makes sure the packages are installed in the cache dir . allowing persistant storage of installed python libs
+                    PKG_DIR: {"bind": "/cache", "mode": "rw"}
+                },
+                network_disabled=False, 
+                mem_limit="512m",       
+                nano_cpus=1000000000,   
+                remove=True             
+            )
+            return f"SUCCESS: Successfully installed and cached libraries: {libraries}"
+        except Exception as e:
+            return f"INSTALLATION FAILED: {str(e)}"
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, run_installer)
+    return result
+
+
+
 @server.tool()
 async def execute_code_sandbox(code: str):
     """
     Executes raw Python code inside a completely isolated, resource-constrained 
-    Docker container. Features a strict 300-second timeout and 512MB RAM limit.
-    Use this to safely verify algorithms, perform heavy calculations, or test code.
+    Docker container. Features a strict 30-second timeout and 512MB RAM limit.
+    Network is COMPLETELY DISABLED. Pre-installed libraries can be imported natively.
     """
     # setup a  isolated workspace inside a temporary directory on my Mac
     # We execute this inside an async thread pool to keep the main I/O channel completely free.
     loop = asyncio.get_running_loop()
-    temp_dir = await loop.run_in_executor(None, tempfile.mkdtemp) # make or use a worker thread to make a temp dir
-    script_path = os.path.join(temp_dir, "sandbox_script.py") # path to the sandbox python file
+    # temp_dir = await loop.run_in_executor(None, tempfile.mkdtemp) # make or use a worker thread to make a temp dir
+    # script_path = os.path.join(temp_dir, "sandbox_script.py") # path to the sandbox python file
+    # removed the use of temp dir. instead using a permanat dir on my mac.
+    script_path = os.path.join(WORKSPACE_DIR, "sandbox_script.py")
     
     def write_script_file():
         with open(script_path, "w", encoding="utf-8") as f: # opening the sand_box file in write mode and writing the python code in it , code being a str 
@@ -246,19 +314,24 @@ async def execute_code_sandbox(code: str):
                 # Execute the script directly and immediately exit when done
                 command=["python", "/workspace/sandbox_script.py"],
                 volumes={
-                    temp_dir: {"bind": "/workspace", "mode": "ro"} # Read-only because we do not trust the llm (the llm should not be always trusted.) because docker doesnt copy our temp file into the container. It instead exposes the temp file through the container. It is like assigning a var b = a . b isnt a copy of a , it IS a any chnage in b results in change in a. If the mount were writable, code running inside the container could modify, delete, or create files in the mounted host directory. hence we restrict the llm to only reading code from this file and not writing code into this file.
+                   PKG_DIR: {"bind": "/cache", "mode": "ro"}, # Read-only because we do not trust the llm (the llm should not be always trusted.) because docker doesnt copy our temp file into the container. It instead exposes the temp file through the container. It is like assigning a var b = a . b isnt a copy of a , it IS a any chnage in b results in change in a. If the mount were writable, code running inside the container could modify, delete, or create files in the mounted host directory. hence we restrict the llm to only reading code from this file and not writing code into this file.
+                    WORKSPACE_DIR: {"bind": "/workspace", "mode": "ro"}
+                },
+                environment={
+                    "PYTHONPATH": "/cache" # this instructs python to use the cache dir to look for installed packages.
                 },
                 detach=True, # with detach = true , the python script for the server and the one in the sandbox run parallelly . The container object gets returned immediately and we can monitor it as it is running it's python script in the sandbox. without detach this server.py would have been blocked till the contaiiner has finished running.
-                network_disabled=False,      #no outbound internet access allowed #changed from TRUE TO FALSE TO ALLOW PIP COMMANDS
+                network_disabled=True,      #no outbound internet access allowed 
                 mem_limit="512m",           # strict protection metric against memory leaks , allocating 128mb of RAM # changed to 512 mb to allow pip commands
-                nano_cpus=100000000,        # cap maximum execution speed at 10% of a single CPU core 
+                nano_cpus=100000000,        # cap maximum execution speed at 30% of a single CPU core 
                 # actually docker measures 1 CPU = 1,000,000,000 nano CPUs so we are using 0.1% of cpu's compute for this sandbox
                 pids_limit=10       
             )
             
-            # Enforce the absolute 3.0 second execution deadline wall
+            # Enforce the absolute 30 second execution deadline wall
             # This waits for the container status to shift to finished
-            result = container.wait(timeout=300) # changed from 3 secoonds to 300 seconds to allow pip commands. 
+            # increased form initial 3 seconds because importing numpy / pandas can itself take longer that 10-15 seconds. the exact 30 second value was a guess.
+            result = container.wait(timeout=30) 
             exit_code = result.get("StatusCode", 0)
             
             # Fetch the compiled execution streams
@@ -285,8 +358,13 @@ async def execute_code_sandbox(code: str):
                     container.remove(force=True)
                 except Exception:
                     pass
+            try:
+                os.remove(script_path)
+            except Exception:
+                pass   
+
             # wipe the host machine's temporary file directory cleanly
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            
 
     # Run our secure container lifecycle routine seamlessly off the main thread
     try:
