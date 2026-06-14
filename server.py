@@ -249,16 +249,16 @@ async def execute_code_sandbox(code: str):
                     temp_dir: {"bind": "/workspace", "mode": "ro"} # Read-only because we do not trust the llm (the llm should not be always trusted.) because docker doesnt copy our temp file into the container. It instead exposes the temp file through the container. It is like assigning a var b = a . b isnt a copy of a , it IS a any chnage in b results in change in a. If the mount were writable, code running inside the container could modify, delete, or create files in the mounted host directory. hence we restrict the llm to only reading code from this file and not writing code into this file.
                 },
                 detach=True, # with detach = true , the python script for the server and the one in the sandbox run parallelly . The container object gets returned immediately and we can monitor it as it is running it's python script in the sandbox. without detach this server.py would have been blocked till the contaiiner has finished running.
-                network_disabled=True,      #no outbound internet access allowed
-                mem_limit="128m",           # strict protection metric against memory leaks , allocating 128mb of RAM
+                network_disabled=False,      #no outbound internet access allowed #changed from TRUE TO FALSE TO ALLOW PIP COMMANDS
+                mem_limit="512m",           # strict protection metric against memory leaks , allocating 128mb of RAM # changed to 512 mb to allow pip commands
                 nano_cpus=100000000,        # cap maximum execution speed at 10% of a single CPU core 
                 # actually docker measures 1 CPU = 1,000,000,000 nano CPUs so we are using 0.1% of cpu's compute for this sandbox
-                pids_limit=10              
+                pids_limit=10       
             )
             
             # Enforce the absolute 3.0 second execution deadline wall
             # This waits for the container status to shift to finished
-            result = container.wait(timeout=3)
+            result = container.wait(timeout=300) # changed from 3 secoonds to 300 seconds to allow pip commands. 
             exit_code = result.get("StatusCode", 0)
             
             # Fetch the compiled execution streams
