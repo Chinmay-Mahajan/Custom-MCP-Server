@@ -11,6 +11,7 @@ from pinecone import AsyncPinecone
 import docker
 import tempfile
 import shutil
+import base64
 
 load_dotenv()
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") # getting the api key from the env file 
@@ -208,7 +209,7 @@ async def query_cloud_knowledge_base(query: str):
         response = await pc.assistants.context(
         assistant_name=ASSISTANT_NAME,
         query=query,
-        top_k=4
+        top_k=4,
         )
         # Extract and format the source citations and text blocks
         context_snippets = []
@@ -389,6 +390,111 @@ async def execute_code_sandbox(code: str):
     except Exception as server_error:
         print(f"CRITICAL SANDBOX FAULT: {str(server_error)}", file=sys.stderr)
         return f"Infrastructure Failure: Could not successfully interface with local Docker daemon: {str(server_error)}"
+
+@server.tool()
+async def generate_and_pack_crust(files: list, archive_name: str):
+    """
+    Generates text or markdown files completely within an isolated, non-persistent container, 
+    compiles them into a custom .crust archive, and streams the finished binary stream 
+    directly back to the chat interface for immediate download.
+    
+    This tool DOES NOT write uncompressed data or modify paths on your Mac host machine.
+    
+    Args:
+        files (list): A list of dicts. Each dict MUST have 'path' (relative only, e.g., 'main.py') 
+                      and 'content' (the raw text payload).
+        archive_name (str): Clean target name for the output archive (e.g., 'workspace.crust').
+    """
+    if not files:
+        return "Error: No files provided to package."
+        
+    if not archive_name.endswith(".crust"):
+        archive_name += ".crust"
+
+    loop = asyncio.get_running_loop()
+
+    def run_isolated_pipeline():
+        client = docker.from_env()
+        container = None
+        try:
+            #Boot up custom image.
+            # It runs with a purely internal container filesystem.
+            container = client.containers.run(
+                image="crust-sandbox:latest",
+                command="sleep 300", # Boot it as a short-lived daemon so we can inject setups
+                detach=True,
+                network_disabled=True,
+                mem_limit="512m",
+                pids_limit=15
+            )
+
+            # Establish isolated workspaces INSIDE the container's internal filesystem
+            container.exec_run("mkdir -p /tmp/staging_zone /tmp/output_zone")
+
+            #Write each text file directly inside the container's boundary
+            for file_item in files:
+                rel_path = file_item.get("path", "").lstrip("/")
+                content = file_item.get("content", "")
+                if not rel_path:
+                    continue
+                
+                # Double-escape single quotes for safe shell payload passing
+                safe_content = content.replace("'", "'\\''")
+                
+                # Make sure child directories exist inside the container
+                container.exec_run(f"mkdir -p /tmp/staging_zone/{os.path.dirname(rel_path)}")
+                
+                # Drop the text contents directly to the virtual container storage
+                container.exec_run(
+                    cmd=["sh", "-c", f"cat << 'EOF' > /tmp/staging_zone/{rel_path}\n{safe_content}\nEOF"]
+                )
+
+            # Trigger custom embedded Rust binary inside the container room
+            pack_cmd = f"crust pack /tmp/staging_zone /tmp/output_zone/{archive_name}"
+            exec_res = container.exec_run(cmd=["sh", "-c", pack_cmd])
+            
+            if exec_res.exit_code != 0:
+                return f"CRUST_COMPILER_ERROR: {exec_res.output.decode('utf-8')}"
+
+            # Extract the finished .crust file bytes directly out of the container's RAM/virtual disk
+            bits_stream_res = container.exec_run(cmd=["cat", f"/tmp/output_zone/{archive_name}"])
+            if bits_stream_res.exit_code != 0:
+                return "Error: Unable to stream bytes back from output sector."
+                
+            raw_binary_bytes = bits_stream_res.output
+
+            #Encode the binary package directly into standard Base64 text
+            b64_string = base64.b64encode(raw_binary_bytes).decode("utf-8")
+            return ("SUCCESS", b64_string)
+
+        except Exception as e:
+            return ("FAILED", str(e))
+        finally:
+            # Completely terminate and vaporize the container footprint instantly
+            if container:
+                try:
+                    container.kill()
+                    container.remove(force=True)
+                except Exception:
+                    pass
+
+    print("Crust Engine: Booting zero-host packaging matrix...", file=sys.stderr)
+    result = await loop.run_in_executor(None, run_isolated_pipeline)
+
+    if isinstance(result, tuple) and result[0] == "SUCCESS":
+        b64_payload = result[1]
+        return (
+            f"--- CRUST CONTAINER PACKAGING COMPLETE ---\n"
+            f"Archive Name: {archive_name}\n"
+            f"Payload Security Status: Host Isolated (No Local File Writes)\n"
+            f"Encoding Format: Base64 Stream\n"
+            f"========================================\n"
+            f"{b64_payload}\n"
+            f"----------------------------------------"
+        )
+    else:
+        error_details = result[1] if isinstance(result, tuple) else result
+        return f"--- CRUST PACKAGING REPORT ---\nStatus: FAILED\nReason: {error_details}"
 
 
 
