@@ -1,6 +1,6 @@
 # MCP Knowledge Base and Code Execution Server
 
-A Model Context Protocol (MCP) server built in Python that exposes a cloud-backed RAG (Retrieval-Augmented Generation) knowledge base and a fully sandboxed Python code execution environment to any MCP-compatible LLM client.
+A Model Context Protocol (MCP) server built in Python that exposes a cloud-backed RAG (Retrieval-Augmented Generation) knowledge base, a fully sandboxed Python code execution environment, and a sandboxed file-packaging tool to any MCP-compatible LLM client.
 
 ---
 
@@ -25,6 +25,7 @@ A Model Context Protocol (MCP) server built in Python that exposes a cloud-backe
     - [`query_cloud_knowledge_base`](#query_cloud_knowledge_base)
     - [`install_libs_sandbox`](#install_libs_sandbox)
     - [`execute_code_sandbox`](#execute_code_sandbox)
+    - [`generate_and_pack_crust`](#generate_and_pack_crust)
   - [Security Model](#security-model)
   - [Design Decisions](#design-decisions)
   - [Known Limitations](#known-limitations)
@@ -34,11 +35,15 @@ A Model Context Protocol (MCP) server built in Python that exposes a cloud-backe
 
 ## Overview
 
-This server implements the [Model Context Protocol](https://modelcontextprotocol.io/) over stdio transport, enabling LLM clients (such as Claude Desktop) to call structured tools at runtime. The server provides two primary capabilities:
+This server implements the [Model Context Protocol](https://modelcontextprotocol.io/) over stdio transport, enabling LLM clients (such as Claude Desktop) to call structured tools at runtime. It's built entirely from raw `asyncio` and JSON-RPC 2.0 — no official MCP SDK — with a custom decorator-based tool registry that derives JSON schemas from Python type hints at registration time.
+
+The server provides three primary capabilities:
 
 1. **Cloud RAG Pipeline** — Documents stored locally can be uploaded to a Pinecone Assistant cloud index. The LLM can then query that index to retrieve semantically relevant excerpts from those documents before composing its response.
 
 2. **Sandboxed Code Execution** — The LLM can request execution of arbitrary Python code inside a resource-constrained Docker container. The execution environment is network-isolated, memory-capped, and CPU-throttled. Libraries required by the code can be pre-installed into a persistent cache volume, preventing redundant downloads.
+
+3. **Sandboxed File Packaging** — The LLM can generate one or more text files and have them packed into a custom `.crust` archive entirely inside an isolated, non-persistent Docker container, with the finished binary streamed back as base64. No uncompressed data ever touches the host filesystem. (See the companion `crust` repository for the archive format and Rust packer itself.)
 
 ---
 
@@ -53,6 +58,12 @@ LLM Client (e.g. Claude Desktop)
 |      MCP Server         |  <-- server.py
 |  (Async I/O Event Loop) |
 +-------------------------+
+        |           |            |
+        |           |            +-----> crust-sandbox container (no host mounts)
+        |           |                        |
+        |           |                   crust pack binary
+        |           |                        |
+        |           |                   base64 stream back to client
         |           |
         |           +-----> Pinecone AsyncPinecone Client
         |                        |
@@ -68,7 +79,7 @@ LLM Client (e.g. Claude Desktop)
                Persistent PKG cache (host volume)
 ```
 
-The server runs a single `asyncio` event loop. All blocking operations — Docker container lifecycle management, file writes, package installation — are dispatched to a thread pool via `loop.run_in_executor`, keeping the stdio I/O channel non-blocking at all times.
+The server runs a single `asyncio` event loop. All blocking operations — Docker container lifecycle management, file writes, package installation — are dispatched to a thread pool via `loop.run_in_executor`, keeping the stdio I/O channel non-blocking at all times. Each incoming JSON-RPC request is wrapped in its own `asyncio.create_task`, so a slow tool call (e.g. a container boot) never blocks the next request from being read off stdin.
 
 ---
 
@@ -79,8 +90,9 @@ The server runs a single `asyncio` event loop. All blocking operations — Docke
 - **Pinecone cloud RAG integration** — upload, index, and query documents
 - **Two-phase Docker sandbox** — separate library installation and code execution containers
 - **Persistent package cache** — libraries installed once, reused across executions via a host-mounted volume
+- **Host-isolated file packaging** — a third sandbox tool that never writes to the host disk, even temporarily
 - **Strict resource constraints** on execution containers: 512 MB RAM, 10% CPU, 10 PID limit, 30-second wall-clock timeout, no network access
-- **Async stdout writer with drain()** to prevent EAGAIN / Errno 35 errors on macOS under high throughput
+- **Async stdout writer with `drain()`** to prevent EAGAIN / Errno 35 errors on macOS under high throughput
 - **Concurrent request handling** via `asyncio.create_task` — multiple tool calls can be in-flight simultaneously
 
 ---
@@ -96,6 +108,7 @@ The server runs a single `asyncio` event loop. All blocking operations — Docke
 | `aiohttp` | Any | HTTP async support |
 | `python-dotenv` | Any | Environment variable loading |
 | `docker` (Python SDK) | Any | Docker Engine interaction |
+| `crust-sandbox:latest` image | — | Built from the companion `crust` repo's Dockerfile; required only for `generate_and_pack_crust` |
 
 Docker Desktop must be running on the host machine before starting the server. The server communicates with the Docker daemon via the default socket.
 
@@ -130,6 +143,15 @@ docker info
 ```
 
 If this command fails, ensure Docker Desktop is running.
+
+**5. (Optional) Build the crust sandbox image**
+
+Only needed if you want `generate_and_pack_crust` to work. Build it from the `crust` repo:
+Repo : https://github.com/Chinmay-Mahajan/Crust---A-Rust-Based-Basic-Archiver-
+
+```bash
+docker build -t crust-sandbox:latest .
+```
 
 ---
 
@@ -297,19 +319,40 @@ Executes a Python script string inside a fully isolated Docker container. The co
 
 ---
 
+### `generate_and_pack_crust`
+
+Generates one or more text/markdown files entirely inside an isolated, non-persistent Docker container (`crust-sandbox:latest`), packs them into a `.crust` archive using the Rust `crust` binary baked into that image, and streams the finished archive back to the client as a base64 string. No intermediate uncompressed file is ever written to the host machine — every step from file creation to packing happens inside the container's own virtual filesystem via `container.exec_run`.
+
+| Parameter | Type | Required |
+|---|---|---|
+| `files` | array of `{path, content}` objects | Yes |
+| `archive_name` | string | Yes |
+
+**Example `files` entry:** `{"path": "main.py", "content": "print('hello')"}`
+
+**Returns:** A report containing the archive name and a base64-encoded payload of the packed `.crust` binary, or a `CRUST_COMPILER_ERROR` / failure report if packing fails.
+
+**Container constraints:** 512 MB RAM, `pids_limit=15`, network disabled, container is killed and removed in a `finally` block regardless of outcome.
+
+> This tool depends on the `crust-sandbox:latest` image being built locally beforehand — it is not pulled automatically. See [Installation](#installation).
+
+---
+
 ## Security Model
 
 The sandbox is designed around a principle of minimal trust toward both the executing code and the LLM issuing the request.
 
-**Network isolation.** The execution container has `network_disabled=True`. No outbound or inbound connections are possible from within a running script.
+**Network isolation.** The execution and packing containers both run with `network_disabled=True`. No outbound or inbound connections are possible from within a running script or packing job.
 
 **Read-only mounts.** Both the package cache directory and the workspace directory are mounted into the execution container as read-only (`mode: "ro"`). Code running inside the container cannot modify, delete, or create files on the host filesystem.
 
-**Resource ceilings.** Hard limits on memory (`512m`), CPU (`nano_cpus`), and process count (`pids_limit=10`) prevent denial-of-service scenarios such as fork bombs, memory exhaustion, or CPU starvation.
+**Zero host mounts for packaging.** `generate_and_pack_crust` goes a step further than `execute_code_sandbox`: the container it boots has no host volume mounts at all. Generated files exist only inside the container's internal filesystem (`/tmp/staging_zone`), and the only thing that ever leaves the container is the final base64-encoded archive byte stream, captured via `exec_run` and returned over stdout to the client. The host disk is never touched.
 
-**Forced timeout and kill.** If a container exceeds 30 seconds, it is forcibly killed via `container.kill()` and then removed. No runaway process can persist beyond this window.
+**Resource ceilings.** Hard limits on memory (`512m`), CPU (`nano_cpus`), and process count (`pids_limit`) prevent denial-of-service scenarios such as fork bombs, memory exhaustion, or CPU starvation.
 
-**Ephemeral containers.** Every execution spawns a fresh, clean container image (`python:3.11-alpine`). No state persists between executions in the container layer itself. The only shared state is the read-only package cache, which contains only pip-installed packages and no user data.
+**Forced timeout and kill.** If the execution container exceeds 30 seconds, it is forcibly killed via `container.kill()` and then removed. No runaway process can persist beyond this window. The packing container is similarly killed and removed in a `finally` block regardless of success or failure.
+
+**Ephemeral containers.** Every execution or packing job spawns a fresh, clean container. No state persists between calls in the container layer itself. The only shared state across calls is the read-only package cache used by `execute_code_sandbox`, which contains only pip-installed packages and no user data.
 
 **Separation of install and execute phases.** Library installation uses a separate container with network access enabled but with its own resource limits. The execution container is always network-disabled, regardless of what libraries are present.
 
@@ -329,6 +372,9 @@ With `detach=True`, the call to `client.containers.run()` returns immediately wi
 **Why a persistent package cache on the host?**
 Without persistence, every call to `execute_code_sandbox` that requires third-party libraries would need to download and install those libraries from PyPI inside the container before running the script. This adds significant latency (tens of seconds for larger packages such as NumPy or Pandas) to every execution. By installing once via `install_libs_sandbox` into a host directory and mounting it read-only into subsequent execution containers, packages are available immediately via `PYTHONPATH=/cache`.
 
+**Why does `generate_and_pack_crust` avoid host mounts entirely, unlike `execute_code_sandbox`?**
+`execute_code_sandbox` only ever needs to *read* LLM-authored code, so a read-only host mount is sufficient and cheap. `generate_and_pack_crust` is a different shape of problem: the LLM is asking the server to *generate and persist* file content. Mounting a host directory read-write so the container could write files there would mean LLM-controlled paths and content touching the host disk directly. Instead, files are written via `exec_run` into the container's own ephemeral filesystem, packed there, and only the final compiled binary — extracted as bytes via another `exec_run` — ever crosses back into the server process. The host filesystem is never part of the trust boundary for this tool.
+
 **Why `await async_writer.drain()` in `send_response`?**
 On macOS, the stdout pipe has a finite kernel buffer. If the server writes faster than the client reads, the buffer fills and subsequent writes raise `BlockingIOError` (Errno 35, EAGAIN). Calling `drain()` after each write yields to the event loop and waits for the OS buffer to clear before the next write proceeds. The `stdout_lock` additionally ensures that concurrent tasks do not interleave their JSON output on the stream.
 
@@ -339,10 +385,12 @@ The MCP protocol uses stdin and stdout exclusively for JSON-RPC message exchange
 
 ## Known Limitations
 
-- The `python:3.11-alpine` image must be available locally or pullable from Docker Hub on first use. In air-gapped environments, the image must be pre-loaded manually.
+- The `python:3.11-alpine` image must be available locally or pullable from Docker Hub on first use. In air-gapped environments, the image must be pre-loaded manually. The same applies to `crust-sandbox:latest`, which must be built manually beforehand — it is never pulled or built automatically by the server.
 - The `install_libs_sandbox` tool requires network access to PyPI. Packages that depend on compiled C extensions may fail to install on Alpine Linux if the required build tools (`gcc`, `musl-dev`) are not present in the image.
 - The 30-second execution timeout may be insufficient for computationally intensive workloads. It can be adjusted by modifying the `timeout` argument passed to `container.wait()` in `execute_code_sandbox`.
 - The Pinecone assistant name is hardcoded as `"my-notes"`. If multiple knowledge bases are required, this should be parameterized.
+- Tool arguments aren't validated beyond what the auto-generated JSON schema's `type` field enforces — no path traversal checks on `folder_path`, no size caps on `code`, and no validation that `files` entries in `generate_and_pack_crust` contain safe relative paths before being interpolated into shell commands inside the container.
+- Exception handling across most tools is a broad `except Exception` that stringifies and returns the error to the LLM — useful for surfacing failures, but it discards the original exception type and traceback.
 - There is no authentication or authorization layer on the MCP server itself. Access control is entirely delegated to the MCP client (Claude Desktop). Do not expose this server over a network interface.
 
 ---
@@ -364,5 +412,4 @@ The sandbox cache is created at runtime outside the project directory:
     workspace/         # Staging area for sandbox scripts (cleaned after each execution)
 ```
 
----
-
+The `crust-sandbox:latest` image used by `generate_and_pack_crust` lives in the separate `crust` repository and must be built there before this server can use it.
