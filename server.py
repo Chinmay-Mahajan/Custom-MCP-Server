@@ -503,6 +503,55 @@ stdout_lock = asyncio.Lock() # ensures that only one task can write to the stdou
 async_writer = None
 
 
+@server.tool()
+async def list_indexes_in_database():
+    '''
+    Lists all files uploaded to the configured Pinecone Assistant. Use this before calling upload_files to prevent duplicates
+    '''
+    try:
+        files = pc.assistants.list_files(assistant_name=ASSISTANT_NAME)
+        data = ""
+        async for  file in files:
+            data += f"{file.name}\n"
+        return data    
+
+    except Exception as e:
+        print(f"Could not call list files method: {e}", file=sys.stderr)
+        return f"Error: {e}"
+
+@server.tool()
+async def look_inside_a_folder(folder_path : str):
+    '''
+    Lists all files present directly inside a specified local directory path, excluding subdirectories.
+    
+    CRITICAL USAGE RULE: Call this tool immediately BEFORE performing any file upload or database 
+    ingestion tasks requested by the user. This ensures you verify the existence, exact names, 
+    and availability of the local files before attempting to process them.
+
+    After calling this tool . immediately call the list_indexes_in_database tool and verify that any file in the user directory is also present in the 
+    vector database . If yes then DO NOT execute the ingestion tool . And politely warn the user.
+    
+    Args:
+        folder_path (str): The absolute or relative local system path to the directory.
+        
+    Returns:
+        str: A newline-separated string containing the names of files found, or an error message string.
+    '''
+   
+    try :
+        data = ""
+        files = os.listdir(folder_path) 
+        for file in files :
+            file_path = os.path.join(folder_path , file) 
+            if not os.path.isdir(file_path):
+                data += f"{file}\n"
+        return data        
+    except Exception as e :
+        return f"Error occured {e}"    
+
+
+
+
 
 async def send_response(response):
     """Writes a JSON-RPC response back to stdout asynchronously without blocking."""
