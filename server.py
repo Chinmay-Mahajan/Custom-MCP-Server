@@ -12,6 +12,8 @@ import docker
 import tempfile
 import shutil
 import base64
+import uuid
+from celery_tasks import run_and_heal, task_store
 
 load_dotenv()
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") # getting the api key from the env file 
@@ -31,9 +33,6 @@ WORKSPACE_DIR = os.path.join(SANDBOX_ROOT, "workspace")
 # Ensure these directories exist on your Mac right when the server boots
 os.makedirs(PKG_DIR, exist_ok=True)
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
-
-
-
 
 try:
 
@@ -496,7 +495,84 @@ async def generate_and_pack_crust(files: list, archive_name: str):
         error_details = result[1] if isinstance(result, tuple) else result
         return f"--- CRUST PACKAGING REPORT ---\nStatus: FAILED\nReason: {error_details}"
 
+@server.tool()
+async def queue_coding_task(task_name: str, code: str):
+    """
+    Queues Python code to run in the sandbox as a background task with
+    automatic error-healing retries (a cheaper background LLM attempts up
+    to 3 fixes on its own). Returns immediately with a task_id — does NOT
+    block. Use list_active_tasks to check progress and get_task_result to
+    retrieve the final code or failure details once it's done.
+    """
+    task_id = str(uuid.uuid4())[:8]
+    task_store.set(f"task:{task_id}", json.dumps({"name": task_name, "status": "QUEUED"}))
+    task_store.sadd("all_task_ids", task_id)
+    run_and_heal.delay(task_id, task_name, code)
+    return f"Queued '{task_name}' as task {task_id}. Check back with list_active_tasks."
 
+
+@server.tool()
+async def list_active_tasks():
+    """
+    Lists every background coding task and its current status
+    (QUEUED, SUCCESS, or STUCK). Call this to check on tasks queued
+    earlier without pulling full code or errors into context.
+    """
+    task_ids = task_store.smembers("all_task_ids")
+    if not task_ids:
+        return "No tasks queued yet."
+    lines = []
+    for tid in task_ids:
+        raw = task_store.get(f"task:{tid}")
+        if raw:
+            d = json.loads(raw)
+            lines.append(f"{tid} — {d['name']}: {d['status']}")
+    return "\n".join(lines)
+
+
+@server.tool()
+async def get_task_result(task_id: str):
+    """
+    Retrieves full details for one background task: the final working code
+    if it succeeded, or the complete failure history across all auto-retry
+    attempts if it's still stuck.
+    """
+    raw = task_store.get(f"task:{task_id}")
+    if not raw:
+        return f"No task found with id '{task_id}'."
+    d = json.loads(raw)
+    if d["status"] == "QUEUED":
+        return f"Task '{d['name']}' is still running."
+    if d["status"] == "SUCCESS":
+        return f"Status: SUCCESS\nSummary: {d['summary']}\n\n--- FINAL WORKING CODE ---\n{d['final_code']}"
+    history = "\n\n".join(
+        f"--- Attempt {a['attempt']} ---\nCode:\n{a['code']}\n\nError:\n{a['output']}"
+        for a in d["attempts"]
+    )
+    return f"Status: STUCK\nSummary: {d['summary']}\n\n{history}"
+
+
+@server.tool()
+async def clear_task_history(only_finished: bool = True):
+    """
+    Clears background coding task records. By default only removes
+    finished tasks (SUCCESS/STUCK), leaving anything still QUEUED intact.
+    Pass only_finished=False to wipe everything, including in-progress
+    or orphaned entries.
+    """
+    task_ids = task_store.smembers("all_task_ids")
+    cleared = 0
+    for tid in task_ids:
+        raw = task_store.get(f"task:{tid}")
+        if not raw:
+            continue
+        status = json.loads(raw).get("status")
+        if only_finished and status == "QUEUED":
+            continue
+        task_store.delete(f"task:{tid}")
+        task_store.srem("all_task_ids", tid)
+        cleared += 1
+    return f"Cleared {cleared} task record(s)."
 
 
 stdout_lock = asyncio.Lock() # ensures that only one task can write to the stdout stream at a time
@@ -548,8 +624,6 @@ async def look_inside_a_folder(folder_path : str):
         return data        
     except Exception as e :
         return f"Error occured {e}"    
-
-
 
 
 
