@@ -17,7 +17,10 @@ celery_app = Celery(
 
 # celery makes a seperate manager process with a pre-defined number of child - processes to execute the queued tasks.
 # since the child processes (and processes in general) each have their own memory (isolated from other process) we use redis which is a key value store on my machines RAM (hence it is really fast)
-# we send the data from the child process via redis to the manager process . 
+# we send the data from the child process via redis . The data goes back to who-ever called .delay() (mcp server) . the manager process has nothing to do with the data
+# this works because Redis is a separate, shared process both the child
+# worker and the MCP server can reach independently — they never talk
+# to each other directly.
 
 task_store = redis.Redis(host="localhost", port=6379, db=2, decode_responses=True)
 
