@@ -544,7 +544,12 @@ async def get_task_result(task_id: str):
     if d["status"] == "QUEUED":
         return f"Task '{d['name']}' is still running."
     if d["status"] == "SUCCESS":
-        return f"Status: SUCCESS\nSummary: {d['summary']}\n\n--- FINAL WORKING CODE ---\n{d['final_code']}"
+        # return f"Status: SUCCESS\nSummary: {d['summary']}\n\n--- FINAL WORKING CODE ---\n{d['final_code']}"
+        return (
+        f"Status: SUCCESS\nSummary: {d['summary']}\n\n"
+        f"--- STDOUT ---\n{d['final_output']}\n\n"
+        f"--- FINAL WORKING CODE ---\n{d['final_code']}"
+    )
     history = "\n\n".join(
         f"--- Attempt {a['attempt']} ---\nCode:\n{a['code']}\n\nError:\n{a['output']}"
         for a in d["attempts"]

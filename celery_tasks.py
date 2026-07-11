@@ -4,6 +4,7 @@ import json
 from google import genai
 from dotenv import load_dotenv
 from sandbox_runner import run_code_in_sandbox
+import re 
 
 # Adding this feature to allow user (me) to queue multiple code execution tasks together in a non blocking fashion . 
 
@@ -26,6 +27,19 @@ task_store = redis.Redis(host="localhost", port=6379, db=2, decode_responses=Tru
 
 MAX_RETRIES = 3
 
+
+def strip_code_fences(text: str) -> str:
+    """Removes markdown code fences if the model added them despite instructions.
+    Handles ```python ... ```, ``` ... ```, and any leading/trailing whitespace."""
+    text = text.strip()
+    fence_pattern = r"^```[a-zA-Z]*\n?(.*?)\n?```$"
+    match = re.match(fence_pattern, text, re.DOTALL)
+
+    if match:
+        return match.group(1).strip()
+
+    return text
+
 def ask_fixer_llm(code: str, error_output: str) -> str:
     client = genai.Client()
     
@@ -38,12 +52,15 @@ def ask_fixer_llm(code: str, error_output: str) -> str:
     )
     
     # using gemini-2.5-flash which is highly optimal for coding tasks and includes a free tier
+    # ONE BUG THOUGH GOTTA HAVE TO ADD A SAFETY NET TO REMOVE THOSE ``` PYTHON` TAGS using regex..
+
+    #fixed it using regex filter 
     response = client.models.generate_content(
         model='gemini-2.5-flash',
         contents=prompt,
     )
     
-    return response.text.strip()
+    return strip_code_fences(response.text.strip())
 
 
 def _same_error(output_a: str, output_b: str) -> bool:
@@ -53,13 +70,14 @@ def _same_error(output_a: str, output_b: str) -> bool:
     return last_line(output_a) == last_line(output_b)
 
 
-def _save(task_id, name, status, final_code, attempts):
+def _save(task_id, name, status, final_code, attempts , final_output = None):
     record = {
         "name": name,
         "status": status,
         "final_code": final_code,
         "attempt_count": len(attempts),
         "attempts": attempts if status == "STUCK" else [],
+        "final_output":final_output,
         "summary": (
             "Passed on first try." if status == "SUCCESS" and len(attempts) == 1
             else f"Fixed after {len(attempts) - 1} auto-retry attempt(s)." if status == "SUCCESS"
@@ -80,8 +98,8 @@ def run_and_heal(task_id: str, task_name: str, code: str):
         attempts.append({"attempt": attempt_num, "code": current_code, "output": output})
 
         if exit_code == 0:
-            _save(task_id, task_name, "SUCCESS", current_code, attempts)
-            return
+            _save(task_id, task_name, "SUCCESS", current_code, attempts, output)
+            return 
 
         if attempt_num > 1 and _same_error(attempts[-1]["output"], attempts[-2]["output"]):
             break
