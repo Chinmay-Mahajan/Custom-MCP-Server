@@ -14,6 +14,7 @@ A self-healing, parallel background task queue built on top of the existing MCP 
 - [Setup](#setup)
 - [Usage](#usage)
 - [Known limitations](#known-limitations)
+- [Security: cross-task directory leak (fixed)](#security-cross-task-directory-leak-fixed)
 - [Troubleshooting](#troubleshooting)
 - [Resetting task history](#resetting-task-history)
 
@@ -144,6 +145,76 @@ Claude calls `list_active_tasks()`, sees current statuses, and pulls full code/e
 - **Orphaned `QUEUED` entries** can occur if a worker dies mid-task. Clean up with `clear_task_history()`.
 
 ---
+
+## Security: cross-task directory leak (fixed)
+
+### The risk
+
+`sandbox_runner.py` originally mounted the **entire `WORKSPACE_DIR`** into every sandbox container, not just the single script file being executed for that task:
+
+```python
+# BEFORE — vulnerable
+volumes={
+    PKG_DIR: {"bind": "/cache", "mode": "ro"},
+    WORKSPACE_DIR: {"bind": "/workspace", "mode": "ro"}   # whole directory mounted
+}
+```
+
+Giving each task a unique filename (`sandbox_{uuid}.py`) only controlled *which file the container's command executed* — it did nothing to restrict what the container could *see*. Any code running inside a sandbox had full read access to the entire workspace directory, meaning it could enumerate and read every other task's script currently sitting on disk:
+
+```python
+# code inside ANY task's container could run this:
+import os
+for f in os.listdir("/workspace"):
+    print(open(f"/workspace/{f}").read())
+```
+
+This mattered most for tasks running **concurrently** (multiple scripts genuinely present in the directory at the same time), and for any script left behind by a failed cleanup (e.g. a crash before the `finally` block's `os.remove()` ran). It defeated part of the actual point of sandboxing: `network_disabled`, `mem_limit`, and `pids_limit` constrain what code can *do*, but this left a wide-open read channel into what code could *see* — including code it had no business seeing.
+
+### The fix
+
+Mount the **specific host file** for that run to a fixed in-container path, instead of mounting the shared directory:
+
+```python
+# AFTER — fixed
+def run_code_in_sandbox(code: str) -> tuple[int, str]:
+    script_name = f"sandbox_{uuid.uuid4().hex[:8]}.py"
+    script_path = os.path.join(WORKSPACE_DIR, script_name)
+
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(code)
+
+    container = client.containers.run(
+        image="python:3.11-alpine",
+        command=["python", "/workspace/script.py"],           # fixed in-container name
+        volumes={
+            PKG_DIR: {"bind": "/cache", "mode": "ro"},
+            script_path: {"bind": "/workspace/script.py", "mode": "ro"}  # single FILE, not the dir
+        },
+        ...
+    )
+```
+
+Each container now gets its own private `/workspace/script.py`, bind-mounted to a different host file per task — no shared directory is ever exposed inside any container, so no task can enumerate or read another task's code. This restores the same single-file mount pattern the original `execute_code_sandbox` tool already used, just made compatible with parallel, uniquely-named files.
+
+### Verification
+
+Three adversarial probe scripts were queued through `queue_coding_task` post-fix to confirm the boundary actually holds:
+
+| Probe | Result |
+|---|---|
+| `os.listdir("/workspace")` | Returns only `['script.py']` — the task's own file, not other tasks' scripts |
+| Guess common paths (`/workspace/sandbox_script.py`, `/app/script.py`, etc.) | All correctly report "does not exist" |
+| Write to `/workspace/script.py` | Correctly blocked: `Read-only file system` |
+| Outbound network connection | Correctly blocked: `Network unreachable` |
+
+Note: `/cache` (the shared package cache) remains visible and shared across all tasks — this is **intentional**, not a leak. It exists specifically so `pip`-installed packages (numpy, pandas, etc.) are available to every task without re-installing, and it never contains task-specific code or data.
+
+**Recommended as a standing regression check:** re-run this same probe set any time `sandbox_runner.py`'s volume/mount configuration is touched in the future.
+
+---
+
+
 
 ## Troubleshooting
 

@@ -28,10 +28,11 @@ def run_code_in_sandbox(code: str) -> tuple[int, str]:
     try:
         container = client.containers.run(
             image="python:3.11-alpine",
-            command=["python", f"/workspace/{script_name}"],
+            command=["python", "/workspace/script.py"],
             volumes={
                 PKG_DIR: {"bind": "/cache", "mode": "ro"},
-                WORKSPACE_DIR: {"bind": "/workspace", "mode": "ro"}
+                # WORKSPACE_DIR: {"bind": "/workspace", "mode": "ro"}
+                script_path: {"bind": "/workspace/script.py", "mode": "ro"}
             },
             environment={"PYTHONPATH": "/cache"},
             detach=True,
@@ -40,6 +41,10 @@ def run_code_in_sandbox(code: str) -> tuple[int, str]:
             nano_cpus=100000000,
             pids_limit=10
         )
+
+        # SECURITY RISK --> so previously I was mounting the WORKSPACE dir to each container , so if a python code like os.listdir(workspace) and can list all the files and also could also read them.
+        # This destroys the container isolation . 
+        # The fix i did. --> I basically now mount only the script and not the full dir .
         result = container.wait(timeout=30)
         exit_code = result.get("StatusCode", 0)
         logs = container.logs(stdout=True, stderr=True).decode("utf-8")
