@@ -11,9 +11,9 @@ from pinecone import AsyncPinecone
 import docker
 import tempfile
 import shutil
-import base64
 import uuid
 from celery_tasks import run_and_heal, task_store
+import redis.asyncio as aioredis
 
 load_dotenv()
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") # getting the api key from the env file 
@@ -25,12 +25,10 @@ pc = AsyncPinecone(api_key=PINECONE_API_KEY)
 print("MCP Server: Synchronizing with Pinecone cloud setup...", file=sys.stderr) # we must print the text to the stderr stream not the usual stdout stream
 # As the MCP server continously operates on the stdin / stdout streams and if we pass a direct plain text sentence into that stream , the json parser will fail to parse it and cause the entire script to fail.
 
-# Define a stable root directory on your Mac host for the sandbox system
+
 SANDBOX_ROOT = os.path.expanduser("~/.mcp_sandbox_cache")
 PKG_DIR = os.path.join(SANDBOX_ROOT, "site-packages")
 WORKSPACE_DIR = os.path.join(SANDBOX_ROOT, "workspace")
-
-# Ensure these directories exist on your Mac right when the server boots
 os.makedirs(PKG_DIR, exist_ok=True)
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
@@ -61,8 +59,10 @@ class MCPServer:
         self.version = version
         self.tools_registry = {} # dict to store corutine objects of the tools.
         self.tools_blueprints = [] # storing the schemea of the tools 
+        self.cache_tools = set() 
 
-    def tool(self):
+
+    def tool(self , cache_able : bool = False):
         """A python decorator to dynamically register tools with their schemas with the mcp sever registry and blueprint."""
         def decorator(func):
             name = func.__name__
@@ -72,7 +72,8 @@ class MCPServer:
             sig = inspect.signature(func) # used to read the structure of a function 
             properties = {}
             required = []
-            
+            if cache_able:
+                self.cache_tools.add(func.__name__)
             for param_name, param in sig.parameters.items():
                 # param contains meta-data regarding the param_name parameter
                 py_type = param.annotation # extract the python type of parameter using type hints 
@@ -114,19 +115,19 @@ server = MCPServer(name="my-scratch-server", version="1.0.0")
 
 
 
-@server.tool()
+@server.tool(False)
 async def calculate_area(width: int, height: int):
     """Calculates the area of a rectangle."""
     return width * height 
 
-@server.tool()
+@server.tool(True)
 async def greet_user(name: str, formal: bool):
     """Greets a user given their name and preference."""
     if formal:
         return f"Good day, Honorable {name}."
     return f"Hey, what's up {name}!"
 
-@server.tool()
+@server.tool(False)
 async def optimize_search_query(raw_user_prompt: str):
     """
     Takes a messy, conversational user prompt and extracts the core 
@@ -147,33 +148,28 @@ async def optimize_search_query(raw_user_prompt: str):
     return instructions
 
 
-@server.tool()
+@server.tool(True) # making this cache-able because we dont wanna accidently upload the same folder twice (ingestion tokens...)
 async def upload_local_folder_to_cloud(folder_path: str):
     """
     Scans a local directory on users machine and securely uploads all PDFs, TXT, 
     and Markdown files to Pinecone's cloud RAG index. 
     Use this when the user says: 'Sync my documents folder' or 'Upload new files'.
     """
-    # Ensure folder exists locally
     if not os.path.exists(folder_path):
         return f"Error: Local path '{folder_path}' could not be located on this machine."
 
     uploaded_files = []
     errors = []
 
-    # Read the directory contents
     for filename in os.listdir(folder_path):
         if filename.lower().endswith((".pdf", ".txt", ".md", ".json")):
             file_path = os.path.join(folder_path, filename)
-            
-            # Printing to stderr so we can see the terminal logs real-time
             print(f"MCP Ingestion: Transferring {filename} to Pinecone cloud...", file=sys.stderr)
             
             try:
                 # Tell Pinecone's cloud infrastructure to ingest, chunk, and index the file
-                # now the pinecone database op is async .
                 response = await pc.assistants.upload_file(
-                assistant_name=ASSISTANT_NAME,  # v9.x takes the name string directly
+                assistant_name=ASSISTANT_NAME,  
                 file_path=file_path,
                 metadata={"uploaded_via": "mcp-server-tool", "local_source": folder_path}
 )
@@ -181,7 +177,6 @@ async def upload_local_folder_to_cloud(folder_path: str):
             except Exception as file_error:
                 errors.append(f"Failed to upload {filename}: {str(file_error)}")
 
-    # Construct status message back to Claude
     status_report = []
     if uploaded_files:
         status_report.append(f"Successfully processed and indexed {len(uploaded_files)} files:\n" + "\n".join(f"- {f}" for f in uploaded_files))
@@ -194,33 +189,26 @@ async def upload_local_folder_to_cloud(folder_path: str):
     return "\n\n".join(status_report)
 
 
-@server.tool()
+@server.tool(True) # again saving context tokens on pinecone 
 async def query_cloud_knowledge_base(query: str):
     """
     Queries our remote cloud document store to extract contextual references.
     Use this whenever the user asks questions about uploaded manuals, documents, or data.
     """
     try:
-        # Print a trace statement to stderr so you can see it execution in your Mac terminal
         print(f"RAG Engine: Fetching remote cloud context for query: '{query}'", file=sys.stderr)
-        #Ask Pinecone to retrieve relevant text snippets matching the text query.
-        # top_k=4 tells it to bring back the 4 best matching document blocks.
         response = await pc.assistants.context(
         assistant_name=ASSISTANT_NAME,
         query=query,
         top_k=4,
         )
-        # Extract and format the source citations and text blocks
         context_snippets = []
         for snippet in response.snippets:
-            # Safely grab file reference names 
             file_name = snippet.reference.file.get("name", "Unknown Source") if snippet.reference else "Unknown Source"
             content_text = snippet.content
             context_snippets.append(f"--- SOURCE DOCUMENT: {file_name} ---\n{content_text}\n")
-        #check if no relevant documents match
         if not context_snippets:
             return "Search complete. No matching references found in the cloud repository."
-        #Hand the pure document facts over to Claude
         formatted_payload = "Extracted Documentation Context:\n\n" + "\n".join(context_snippets)
         return formatted_payload
     except Exception as e:
@@ -237,7 +225,13 @@ async def query_cloud_knowledge_base(query: str):
 
 # in the code_executor tool I just tell python to read lib from that permanant dir on my mac. So I dont need to download the libs again and again 
 
-@server.tool()
+'''
+only making the RAG features cache-able cuz , these code sandbox tools had they been cached they would have outputted misleading info.
+If a code execution is a cached then calling it again (or a code that is very similar) might return the same thing (failing silently).The user has no idea 
+Only if they probe into the tool result they will see the cache hit. Hence I would rather wait a bit and get a 100 % correct ans than a 98% correct fast ans. 
+'''
+
+@server.tool(False) 
 async def install_libs_sandbox(libraries: list):
     """
     Installs one or more third-party Python packages (e.g., ['numpy', 'requests']) 
@@ -253,8 +247,7 @@ async def install_libs_sandbox(libraries: list):
         client = docker.from_env()
         libs_string = " ".join(libraries)
         try:
-            # Phase 1: High resource allowance, network active, but isolated execution command
-            # It maps the host package directory as Read-Write (rw)
+            
             client.containers.run(
                 image="python:3.11-alpine",
                 #tell pip to install directly into /cache
@@ -281,7 +274,7 @@ async def install_libs_sandbox(libraries: list):
 
 
 
-@server.tool()
+@server.tool(False)
 async def execute_code_sandbox(code: str):
     """
     Executes raw Python code inside a completely isolated, resource-constrained 
@@ -390,112 +383,9 @@ async def execute_code_sandbox(code: str):
         print(f"CRITICAL SANDBOX FAULT: {str(server_error)}", file=sys.stderr)
         return f"Infrastructure Failure: Could not successfully interface with local Docker daemon: {str(server_error)}"
 
-@server.tool()
-async def generate_and_pack_crust(files: list, archive_name: str):
-    """
-    Generates text or markdown files completely within an isolated, non-persistent container, 
-    compiles them into a custom .crust archive, and streams the finished binary stream 
-    directly back to the chat interface for immediate download.
-    
-    This tool DOES NOT write uncompressed data or modify paths on your Mac host machine.
-    
-    Args:
-        files (list): A list of dicts. Each dict MUST have 'path' (relative only, e.g., 'main.py') 
-                      and 'content' (the raw text payload).
-        archive_name (str): Clean target name for the output archive (e.g., 'workspace.crust').
-    """
-    if not files:
-        return "Error: No files provided to package."
-        
-    if not archive_name.endswith(".crust"):
-        archive_name += ".crust"
 
-    loop = asyncio.get_running_loop()
 
-    def run_isolated_pipeline():
-        client = docker.from_env()
-        container = None
-        try:
-            #Boot up custom image.
-            # It runs with a purely internal container filesystem.
-            container = client.containers.run(
-                image="crust-sandbox:latest",
-                command="sleep 300", # Boot it as a short-lived daemon so we can inject setups
-                detach=True,
-                network_disabled=True,
-                mem_limit="512m",
-                pids_limit=15
-            )
-
-            # Establish isolated workspaces INSIDE the container's internal filesystem
-            container.exec_run("mkdir -p /tmp/staging_zone /tmp/output_zone")
-
-            #Write each text file directly inside the container's boundary
-            for file_item in files:
-                rel_path = file_item.get("path", "").lstrip("/")
-                content = file_item.get("content", "")
-                if not rel_path:
-                    continue
-                
-                # Double-escape single quotes for safe shell payload passing
-                safe_content = content.replace("'", "'\\''")
-                
-                # Make sure child directories exist inside the container
-                container.exec_run(f"mkdir -p /tmp/staging_zone/{os.path.dirname(rel_path)}")
-                
-                # Drop the text contents directly to the virtual container storage
-                container.exec_run(
-                    cmd=["sh", "-c", f"cat << 'EOF' > /tmp/staging_zone/{rel_path}\n{safe_content}\nEOF"]
-                )
-
-            # Trigger custom embedded Rust binary inside the container room
-            pack_cmd = f"crust pack /tmp/staging_zone /tmp/output_zone/{archive_name}"
-            exec_res = container.exec_run(cmd=["sh", "-c", pack_cmd])
-            
-            if exec_res.exit_code != 0:
-                return f"CRUST_COMPILER_ERROR: {exec_res.output.decode('utf-8')}"
-
-            # Extract the finished .crust file bytes directly out of the container's RAM/virtual disk
-            bits_stream_res = container.exec_run(cmd=["cat", f"/tmp/output_zone/{archive_name}"])
-            if bits_stream_res.exit_code != 0:
-                return "Error: Unable to stream bytes back from output sector."
-                
-            raw_binary_bytes = bits_stream_res.output
-
-            #Encode the binary package directly into standard Base64 text
-            b64_string = base64.b64encode(raw_binary_bytes).decode("utf-8")
-            return ("SUCCESS", b64_string)
-
-        except Exception as e:
-            return ("FAILED", str(e))
-        finally:
-            # Completely terminate and vaporize the container footprint instantly
-            if container:
-                try:
-                    container.kill()
-                    container.remove(force=True)
-                except Exception:
-                    pass
-
-    print("Crust Engine: Booting zero-host packaging matrix...", file=sys.stderr)
-    result = await loop.run_in_executor(None, run_isolated_pipeline)
-
-    if isinstance(result, tuple) and result[0] == "SUCCESS":
-        b64_payload = result[1]
-        return (
-            f"--- CRUST CONTAINER PACKAGING COMPLETE ---\n"
-            f"Archive Name: {archive_name}\n"
-            f"Payload Security Status: Host Isolated (No Local File Writes)\n"
-            f"Encoding Format: Base64 Stream\n"
-            f"========================================\n"
-            f"{b64_payload}\n"
-            f"----------------------------------------"
-        )
-    else:
-        error_details = result[1] if isinstance(result, tuple) else result
-        return f"--- CRUST PACKAGING REPORT ---\nStatus: FAILED\nReason: {error_details}"
-
-@server.tool()
+@server.tool(False)
 async def queue_coding_task(task_name: str, code: str):
     """
     Queues Python code to run in the sandbox as a background task with
@@ -511,7 +401,7 @@ async def queue_coding_task(task_name: str, code: str):
     return f"Queued '{task_name}' as task {task_id}. Check back with list_active_tasks."
 
 
-@server.tool()
+@server.tool(False) # util tools like these should not be cached 
 async def list_active_tasks():
     """
     Lists every background coding task and its current status
@@ -530,7 +420,7 @@ async def list_active_tasks():
     return "\n".join(lines)
 
 
-@server.tool()
+@server.tool(False)
 async def get_task_result(task_id: str):
     """
     Retrieves full details for one background task: the final working code
@@ -557,7 +447,7 @@ async def get_task_result(task_id: str):
     return f"Status: STUCK\nSummary: {d['summary']}\n\n{history}"
 
 
-@server.tool()
+@server.tool(False)
 async def clear_task_history(only_finished: bool = True):
     """
     Clears background coding task records. By default only removes
@@ -583,8 +473,24 @@ async def clear_task_history(only_finished: bool = True):
 stdout_lock = asyncio.Lock() # ensures that only one task can write to the stdout stream at a time
 async_writer = None
 
+@server.tool(cache_able=False) # util fn 
+async def administrative_clear_cache():
+    """
+    Completely flushes and clears the local Redis semantic cache index records.
+    Use this utility when cache records are stale or producing misleading context hits.
+    """
+    try:
+        redis_client = aioredis.from_url("redis://localhost:6379", decode_responses=True)
+        #  importing the clear_semantic_cache
+        from Cache_handling.proxy_gateway import clear_semantic_cache
+        result = await clear_semantic_cache(redis_client)
+        await redis_client.close()
+        return result
+    except Exception as e:
+        return f"CACHE PURGE FAILED: {str(e)}"
 
-@server.tool()
+
+@server.tool(False)
 async def list_indexes_in_database():
     '''
     Lists all files uploaded to the configured Pinecone Assistant. Use this before calling upload_files to prevent duplicates
@@ -600,7 +506,7 @@ async def list_indexes_in_database():
         print(f"Could not call list files method: {e}", file=sys.stderr)
         return f"Error: {e}"
 
-@server.tool()
+@server.tool(False)
 async def look_inside_a_folder(folder_path : str):
     '''
     Lists all files present directly inside a specified local directory path, excluding subdirectories.
@@ -659,7 +565,8 @@ async def handle_request(request):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools":{"listChanged": True}},
-                "serverInfo": {"name": server.name, "version": server.version}
+                "serverInfo": {"name": server.name, "version": server.version , "meta": {"cacheable_tools": list(server.cache_tools)}},
+                
             }
         }
     
