@@ -22,7 +22,6 @@ def run_code_in_sandbox(code: str) -> tuple[int, str]:
 
     with open(script_path, "w", encoding="utf-8") as f:
         f.write(code)
-
     client = docker.from_env()
     container = None
     try:

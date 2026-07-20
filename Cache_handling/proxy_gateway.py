@@ -178,7 +178,6 @@ async def clear_semantic_cache(redis_client) -> str:
 async def main():
     log_proxy_action("\nProxy Gateway starting up...")
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
-    
     # we start up the server.py in a child process (since we want the server to be responsive) , we have to specify the python env that we will use (that has all our dependencies) 
     # and the actual path to the python file 
     # The server and the proxy communicate over a private memeory pipeline completely sep than proxy and client 

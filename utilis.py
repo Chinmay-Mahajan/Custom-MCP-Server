@@ -7,7 +7,6 @@ _LIB_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,213}(==[A-Za-z0-9_.!+-]
 #  regex pattern to catch -- flags , and commands that can download python packages via Version Control systems
 _MAX_LIBS = 25  # prevents Denial Of Service attacks (since install_libs_sandbox tool runs inside a loose docker container which has 100% cpu utilization privialge)
 
-
 def _validate_libraries(libraries: list) -> list[str]:
     """Validates and normalizes the library list. Raises ValueError on anything suspicious."""
     if not isinstance(libraries, list) or not libraries:
