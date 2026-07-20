@@ -13,7 +13,8 @@ import tempfile
 import shutil
 import uuid
 from celery_tasks import run_and_heal, task_store
-import redis.asyncio as aioredis
+import redis.asyncio as aioredis 
+from utilis import _validate_libraries
 
 load_dotenv()
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") # getting the api key from the env file 
@@ -231,42 +232,67 @@ If a code execution is a cached then calling it again (or a code that is very si
 Only if they probe into the tool result they will see the cache hit. Hence I would rather wait a bit and get a 100 % correct ans than a 98% correct fast ans. 
 '''
 
-@server.tool(False) 
+@server.tool(False)
 async def install_libs_sandbox(libraries: list):
     """
-    Installs one or more third-party Python packages (e.g., ['numpy', 'requests']) 
-    into the secure sandbox environment. 
-    Use this tool BEFORE executing code if the user's script requires external libraries.
+    Installs one or more third-party Python packages (e.g., ['numpy', 'requests==2.31.0']) into the secure sandbox environment.Use this tool BEFORE executing code if the user's script requires external libraries.Only exact package==version specifiers are accepted; URLs, VCS refs, and flags are rejected.
     """
-    if not libraries:
-        return "No libraries specified for installation."
+    try:
+        libraries = _validate_libraries(libraries)
+    except ValueError as e:
+        return f"REJECTED: {e}"
 
     print(f"Sandbox Infra: Launching Installer for: {libraries}", file=sys.stderr)
-    
+
     def run_installer():
         client = docker.from_env()
-        libs_string = " ".join(libraries)
+        container = None
         try:
-            
-            client.containers.run(
+            container = client.containers.run(
                 image="python:3.11-alpine",
-                #tell pip to install directly into /cache
                 command=[
-                    "sh", "-c", 
-                    f"python3 -m ensurepip --upgrade && pip install --no-cache-dir --target=/cache {libs_string}"
+                    "pip", "install",
+                    "--no-cache-dir",
+                    "--only-binary=:all:",           
+                    "--index-url", "https://pypi.org/simple",
+                    "--target=/cache",
+                    *libraries,
                 ],
                 volumes={
-                    # Mount host cache directory to /cache inside the container , this makes sure the packages are installed in the cache dir . allowing persistant storage of installed python libs
                     PKG_DIR: {"bind": "/cache", "mode": "rw"}
                 },
-                network_disabled=False, 
-                mem_limit="512m",       
-                nano_cpus=1000000000,   
-                remove=True             
+                user="1000:1000",           # non-root inside the container
+                cap_drop=["ALL"],           # drop all Linux capabilities
+                security_opt=["no-new-privileges"],
+                network_disabled=False,     # pip needs PyPI; see README for residual risk
+                mem_limit="512m",
+                nano_cpus=1_000_000_000,
+                pids_limit=10,
+                detach=True,                # required so we can enforce our own timeout below
             )
-            return f"SUCCESS: Successfully installed and cached libraries: {libraries}"
+
+            result = container.wait(timeout=45)
+            exit_code = result.get("StatusCode", 0)
+            logs = container.logs(stdout=True, stderr=True).decode("utf-8")
+
+            if exit_code != 0:
+                return f"INSTALLATION FAILED (exit {exit_code}):\n{logs[-2000:]}"
+            return f"SUCCESS: Installed and cached libraries: {libraries}"
+
         except Exception as e:
+            if container:
+                try:
+                    container.kill()
+                except Exception:
+                    pass
             return f"INSTALLATION FAILED: {str(e)}"
+
+        finally:
+            if container:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
 
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, run_installer)
