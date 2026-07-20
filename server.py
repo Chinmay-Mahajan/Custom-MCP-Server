@@ -111,7 +111,7 @@ class MCPServer:
             return func
         return decorator
 
-# Instantiate your core server object
+
 server = MCPServer(name="my-scratch-server", version="1.0.0")
 
 
