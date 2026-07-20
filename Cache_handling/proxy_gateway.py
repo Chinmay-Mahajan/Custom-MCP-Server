@@ -158,7 +158,6 @@ async def handle_server_to_client(reader: asyncio.StreamReader, writer: asyncio.
 
 async def clear_semantic_cache(redis_client) -> str:
     """Scans and clears all proxy semantic keys, sets, and counters from Redis."""
-    # locate all specific keys used by the caching engine
     turn_keys = await redis_client.keys("turn:*")
     session_keys = await redis_client.keys("session:*")
     counter_keys = await redis_client.keys("global:turn:counter")
@@ -167,8 +166,6 @@ async def clear_semantic_cache(redis_client) -> str:
     
     if not all_target_keys:
         return "Cache is already empty. No indices found to wipe."
-    
-    # delete the matched tracking blocks using a pipeline
     async with redis_client.pipeline(transaction=True) as pipe:
         for key in all_target_keys:
             pipe.delete(key)

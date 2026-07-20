@@ -39,7 +39,14 @@ def run_code_in_sandbox(code: str) -> tuple[int, str]:
             network_disabled=True,
             mem_limit="512m",
             nano_cpus=100000000,
-            pids_limit=10
+            pids_limit=10, 
+            user="1000:1000", # running these containers as a non root user , 
+            cap_drop=["ALL"] # dropping all the linux capabilites 
+            # If the LLM queues a python script that can exploit kernel level vulnerabilities then the container can be escaped and the malicious code can interact with the other docker containers that are running on the same linux VM kernel. 
+            # stuff like our cache could be compromised . 
+
+            # having docker run containers on linux VM saves my mac from a container escape but within the VM the other containers can be stopped and redis's stored data (which is on the ram ) can be read
+
         )
 
         # SECURITY RISK --> so previously I was mounting the WORKSPACE dir to each container , so if a python code like os.listdir(workspace) and can list all the files and also could also read them.

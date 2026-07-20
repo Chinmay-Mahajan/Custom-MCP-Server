@@ -252,14 +252,14 @@ async def install_libs_sandbox(libraries: list):
                 image="python:3.11-alpine",
                 command=[
                     "pip", "install",
-                    "--no-cache-dir",
-                    "--only-binary=:all:",           
-                    "--index-url", "https://pypi.org/simple",
-                    "--target=/cache",
+                    "--no-cache-dir", # dont use the default python cache 
+                    "--only-binary=:all:", # install only binary files (compiled) and not source code  
+                    "--index-url", "https://pypi.org/simple", # installing packages from a trusted source which is heavily monitored
+                    "--target=/cache", # install in the /cache inside the container 
                     *libraries,
                 ],
                 volumes={
-                    PKG_DIR: {"bind": "/cache", "mode": "rw"}
+                    PKG_DIR: {"bind": "/cache", "mode": "rw"} # mounting the PKG_DIR to the container as read-write
                 },
                 user="1000:1000",           # non-root inside the container
                 cap_drop=["ALL"],           # drop all Linux capabilities
@@ -344,7 +344,9 @@ async def execute_code_sandbox(code: str):
                 mem_limit="512m",           # strict protection metric against memory leaks , allocating 128mb of RAM # changed to 512 mb to allow pip commands
                 nano_cpus=100000000,        # cap maximum execution speed at 30% of a single CPU core 
                 # actually docker measures 1 CPU = 1,000,000,000 nano CPUs so we are using 0.1% of cpu's compute for this sandbox
-                pids_limit=10       
+                pids_limit=10 , 
+                user="1000:1000" , # even though docker containers are run on top of lightweight linux VM on macos , I should run containers as a non - root user . Just a good practise
+                cap_drop=["ALL"]   
             )
             
             # Enforce the absolute 30 second execution deadline wall
