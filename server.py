@@ -33,24 +33,27 @@ WORKSPACE_DIR = os.path.join(SANDBOX_ROOT, "workspace")
 os.makedirs(PKG_DIR, exist_ok=True)
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
-try:
 
-    active_assistants = pc.assistants.list() # returns the list of all assistants currently running in pinecone
-    existing_names = [a.name for a in active_assistants]
-    if ASSISTANT_NAME not in existing_names:
-        print(f"MCP Server: '{ASSISTANT_NAME}' not found. Spawning new cloud instance...", file=sys.stderr)
-        # In v9.x, the method is .create() with 'name=' instead of 'assistant_name=' ---> was stuck here 
-        pc.assistants.create(
-            name=ASSISTANT_NAME,
-            instructions="You are a precise search engine. Extract factual information accurately."
-        )
-        time.sleep(5)  # used because making new resource in the cloud provider is asynchronous , meaning when i instruct pinecone to make a new database (index) it starts executing it and gives back control to my python loop . Even though the index may not have been made the python script can move forward with uploading files to cloud , or querying the cloud knowlegde base.
-    else:
-        print(f"MCP Server: Found existing cloud assistant instance '{ASSISTANT_NAME}'.", file=sys.stderr)
-    print("MCP Server: Cloud RAG engine connected and synchronized successfully!", file=sys.stderr)
+async def init_pinecone():
+    try:
+        active_assistants = pc.assistants.list()
+        existing_names = []
+        async for assistant in active_assistants:
+            existing_names.append(assistant.name)
+        if ASSISTANT_NAME not in existing_names:
+            print(f"MCP Server: '{ASSISTANT_NAME}' not found. Spawning new cloud instance...", file=sys.stderr)
+            await pc.assistants.create(
+                name=ASSISTANT_NAME,
+                instructions="You are a precise search engine. Extract factual information accurately."
+            )
+            await asyncio.sleep(5)  
+        else:
+            print(f"MCP Server: Found existing cloud assistant instance '{ASSISTANT_NAME}'.", file=sys.stderr)
+            
+        print("MCP Server: Cloud RAG engine connected and synchronized successfully!", file=sys.stderr)
 
-except Exception as init_err:
-    print(f"CRITICAL INITIALIZATION ERROR: {str(init_err)}", file=sys.stderr)
+    except Exception as init_err:
+        print(f"CRITICAL INITIALIZATION ERROR: {str(init_err)}", file=sys.stderr)
 
 
 
@@ -662,6 +665,7 @@ async def process_request(request):
 
 async def main():
     global async_writer
+    await init_pinecone()
     loop = asyncio.get_running_loop()
     w_transport, w_protocol = await loop.connect_write_pipe(
         asyncio.streams.FlowControlMixin, 
